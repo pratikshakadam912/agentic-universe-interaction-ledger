@@ -43,7 +43,7 @@ def ingest_lead_file(csv_path):
     # Store valid leads and merge duplicates.
     duplicate_count = store_leads(valid_leads)
 
-    # Save rejections and processing statistics.
+
     stats = {
         "lead_rows_total": total_rows,
         "lead_rows_rejected": rejected_rows,

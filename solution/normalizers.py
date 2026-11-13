@@ -49,11 +49,17 @@ def normalize_decimal(value: str) -> Decimal:
     cleaned = value.strip()
 
     cleaned = re.sub(
-        r"^(?:\u20B9|INR|Rs\.?)\s*",
+        r"^(?:₹|INR|Rs\.?)\s*",
         "",
         cleaned,
         flags=re.IGNORECASE
     )
+
+    # Validate numeric format and thousands separators.
+    pattern = r"^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$"
+
+    if not re.fullmatch(pattern, cleaned):
+        raise ValueError("invalid_decimal")
 
     cleaned = cleaned.replace(",", "")
 
@@ -69,6 +75,7 @@ def normalize_decimal(value: str) -> Decimal:
         Decimal("0.01"),
         rounding=ROUND_HALF_UP
     )
+
 
 def normalize_enum(value: str, allowed_values: list) -> str:
     """Validate an enum value without case sensitivity."""

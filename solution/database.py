@@ -62,6 +62,19 @@ def init_db():
                 source_file TEXT NOT NULL
             );
 
+            -- Keep the event ledger append-only.
+            CREATE TRIGGER IF NOT EXISTS prevent_event_update
+            BEFORE UPDATE ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'events are append-only');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS prevent_event_delete
+            BEFORE DELETE ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'events are append-only');
+            END;
+
             CREATE INDEX IF NOT EXISTS idx_events_call
             ON events(workflow_id, call_id);
 

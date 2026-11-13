@@ -1,3 +1,4 @@
+
 import json
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +12,11 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 def normalize_timestamp(value):
-    value = str(value).strip()
+    """Convert UTC, offset-aware and naive timestamps into IST ISO format."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid_timestamp")
+
+    value = value.strip()
 
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
@@ -19,12 +24,15 @@ def normalize_timestamp(value):
     parsed = datetime.fromisoformat(value)
 
     if parsed.tzinfo is None:
+        # Naive timestamps are interpreted as IST.
         parsed = parsed.replace(tzinfo=IST)
 
     return parsed.astimezone(IST).isoformat()
 
 
 def process_event_file(file_path):
+    """Ingest one JSONL event file into the append-only ledger."""
+
     init_db()
 
     path = Path(file_path)
@@ -56,68 +64,36 @@ def process_event_file(file_path):
         with path.open("r", encoding="utf-8-sig") as file:
 
             for line in file:
+
+                # Empty lines do not count.
                 if not line.strip():
                     continue
 
                 events_total += 1
 
-                # Parse and validate event
+                #  Parse JSON and validate event_id.
                 try:
                     event = json.loads(line)
 
                     if not isinstance(event, dict):
                         raise ValueError("Event must be an object")
 
-                    if not event.get("event_id"):
+                    event_id = event.get("event_id")
+
+                    if event_id is None or not str(event_id).strip():
                         raise ValueError("Missing event_id")
 
-                    required_fields = (
-                        "event_type",
-                        "workflow_id",
-                        "call_id",
-                        "occurred_at",
-                        "payload",
-                    )
-
-                    if any(not event.get(key) for key in required_fields):
-                        raise ValueError("Missing required field")
-
-                    if not isinstance(event["payload"], dict):
-                        raise ValueError("Payload must be an object")
-
-                    occurred_at = normalize_timestamp(
-                        event["occurred_at"]
-                    )
-
-                    # Normalize and hash phone
-                    phone_hash = None
-
-                    if event.get("phone"):
-                        try:
-                            canonical_phone = normalize_phone(
-                                str(event["phone"])
-                            )
-                            phone_hash = hash_pii(canonical_phone)
-
-                        except ValueError:
-                            phone_hash = None
-
-                    # Store payload without raw phone
-                    payload = event["payload"]
+                    event_id = str(event_id).strip()
 
                 except (
                     json.JSONDecodeError,
                     ValueError,
                     TypeError,
-                    KeyError,
-                    OverflowError,
                 ):
                     malformed_events += 1
                     continue
 
-                # Deduplicate globally by event_id
-                event_id = str(event["event_id"])
-
+                #  Check duplicate event ID immediately.
                 existing = conn.execute(
                     """
                     SELECT 1
@@ -131,7 +107,66 @@ def process_event_file(file_path):
                     duplicate_events += 1
                     continue
 
-                # Insert event into ledger
+                #  Validate remaining event fields.
+                try:
+                    required_fields = (
+                        "event_type",
+                        "workflow_id",
+                        "call_id",
+                        "occurred_at",
+                    )
+
+                    for field in required_fields:
+                        value = event.get(field)
+
+                        if (
+                            not isinstance(value, str)
+                            or not value.strip()
+                        ):
+                            raise ValueError(
+                                f"Missing or invalid {field}"
+                            )
+
+                    if not isinstance(event.get("payload"), dict):
+                        raise ValueError("Payload must be an object")
+
+                    event_type = event["event_type"].strip()
+                    workflow_id = event["workflow_id"].strip()
+                    call_id = event["call_id"].strip()
+
+                    occurred_at = normalize_timestamp(
+                        event["occurred_at"]
+                    )
+
+                    # Normalize and hash phone.
+
+                    phone_hash = None
+
+                    if event.get("phone") not in (None, ""):
+                        try:
+                            canonical_phone = normalize_phone(
+                                str(event["phone"])
+                            )
+
+                            phone_hash = hash_pii(canonical_phone)
+
+                        except ValueError:
+                            phone_hash = None
+
+                    # Keep payload data.
+
+                    payload = event["payload"]
+
+                except (
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    OverflowError,
+                ):
+                    malformed_events += 1
+                    continue
+
+               # Append event to the ledger.
                 conn.execute(
                     """
                     INSERT INTO events (
@@ -148,9 +183,9 @@ def process_event_file(file_path):
                     """,
                     (
                         event_id,
-                        str(event["event_type"]),
-                        str(event["workflow_id"]),
-                        str(event["call_id"]),
+                        event_type,
+                        workflow_id,
+                        call_id,
                         occurred_at,
                         phone_hash,
                         json.dumps(payload),
@@ -164,7 +199,7 @@ def process_event_file(file_path):
             "duplicate_events_dropped": duplicate_events,
         }
 
-        # Mark file as processed
+        # Record completed file for idempotent ingestion
         conn.execute(
             """
             INSERT INTO processed_event_files (
@@ -176,13 +211,16 @@ def process_event_file(file_path):
             (source_file, json.dumps(stats))
         )
 
-    # Resolve event-to-lead relationships
+    #  Resolve links and quarantine orphan events
+   
     resolve_event_links()
 
     return stats
 
 
 def process_event_directory(directory):
+    """Process all JSONL files in deterministic filename order."""
+
     directory = Path(directory)
     results = []
 
@@ -195,13 +233,17 @@ def process_event_directory(directory):
 
 
 def get_linked_phone_hash(conn, event):
+    """
+    Resolve the phone hash for an event.
 
-    # Regular events use their own phone hash
+    Regular events use their own phone hash.
+    Overrides inherit the phone hash from another event
+    belonging to the same workflow and call.
+    """
+
     if event["event_type"] != "disposition.override":
         return event["phone_hash"]
 
-    # Override events inherit phone hash from another
-    # event belonging to the same workflow and call
     linked_event = conn.execute(
         """
         SELECT phone_hash
@@ -225,9 +267,13 @@ def get_linked_phone_hash(conn, event):
 
 def resolve_event_links():
     """
-    Recheck ledger events against available leads.
-    Recovers previously orphaned events when leads
-    are uploaded later.
+    Resolve ledger events against currently available leads.
+
+    Previously orphaned events are linked when their leads
+    arrive in a later drop.
+
+    Events remain append-only. Only relationship and
+    quarantine tables are updated.
     """
 
     init_db()
@@ -252,6 +298,7 @@ def resolve_event_links():
             lead = None
 
             if phone_hash:
+
                 lead = conn.execute(
                     """
                     SELECT 1
